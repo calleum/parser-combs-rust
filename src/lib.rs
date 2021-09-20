@@ -1,10 +1,4 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+type ParseResult<'a, Output> = Result<(&'a str, Output), &'a str>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Element {
@@ -13,25 +7,61 @@ struct Element {
     children: Vec<Element>,
 }
 
-// Fn(&str) -> Result<(&str, Element), &str>
-// Fn(Input) -> Result<(Input, Output), Error>
-/**
-    fn the_letter_a(input: &str) -> Result<(&str, Element), &str> {
-        match input.chars().next() {
-            Some('a') => Ok((&input['a'.len_utf8()..], ())),
-            _ => Err(input),
-        }
-    }
-*/
+trait Parser<'a, Output> {
+    fn parse(&self, input: &'a str) -> ParseResult<'a, Output>;
+}
 
-fn match_literal(expected: &'static str) -> impl Fn(&str) -> Result<(&str, ()), &str> {
-    move |input| match input.get(0..expected.len()) {
+impl<'a, F, Output> Parser<'a, Output> for F
+where
+    F: Fn(&'a str) -> ParseResult<Output>,
+{
+    fn parse(&self, input: &'a str) -> ParseResult<'a, Output> {
+        self(input)
+    }
+}
+
+fn match_literal<'a>(expected: &'static str) -> impl Parser<'a, ()> {
+    move |input: &'a str| match input.get(0..expected.len()) {
         Some(next) if next == expected => Ok((&input[expected.len()..], ())),
         _ => Err(input),
     }
 }
 
-fn identifier(input: &str) -> Result<(&str, String), &str> {
+fn any_char(input: &str) -> ParseResult<char> {
+    match input.chars().next() {
+        Some(next) => Ok((&input[next.len_utf8()..], next)),
+        _ => Err(input),
+    }
+}
+
+fn pred<'a, P, A, F>(parser: P, predicate: F) -> impl Parser<'a, A>
+where
+    P: Parser<'a, A>,
+    F: Fn(&A) -> bool,
+{
+    move |input| {
+        if let Ok((next_input, value)) = parser.parse(input) {
+            if predicate(&value) {
+                return Ok((next_input, value));
+            }
+        }
+        Err(input)
+    }
+}
+
+fn whitespace_chars<'a>() -> impl Parser<'a, char> {
+    pred(any_char, |c| c.is_whitespace())
+}
+
+fn space_one<'a>() -> impl Parser<'a, Vec<char>> {
+    one_or_many(whitespace_chars())
+}
+
+fn space_zero<'a>() -> impl Parser<'a, Vec<char>> {
+    zero_or_many(whitespace_chars())
+}
+
+fn identifier(input: &str) -> ParseResult<String> {
     let mut matched = String::new();
     let mut chars = input.chars();
 
@@ -52,32 +82,112 @@ fn identifier(input: &str) -> Result<(&str, String), &str> {
     Ok((&input[next_index..], matched))
 }
 
-fn pair<P1, P2, R1, R2>(parser1: P1, parser2: P2) -> impl Fn(&str) -> Result<(&str, (R1, R2)), &str>
+fn pair<'a, P1, P2, R1, R2>(parser1: P1, parser2: P2) -> impl Parser<'a, (R1, R2)>
 where
-    P1: Fn(&str) -> Result<(&str, R1), &str>,
-    P2: Fn(&str) -> Result<(&str, R2), &str>,
+    P1: Parser<'a, R1>,
+    P2: Parser<'a, R2>,
 {
-    move |input| match parser1(input) {
-        Ok((next_input, result1)) => match parser2(next_input) {
-            Ok((final_input, result2)) => Ok((final_input, (result1, result2))),
-            Err(err) => Err(err),
-        },
-        Err(err) => Err(err),
+    move |input| {
+        parser1.parse(input).and_then(|(next_input, result1)| {
+            parser2
+                .parse(next_input)
+                .map(|(last_input, result2)| (last_input, (result1, result2)))
+        })
     }
 }
 
-fn map<P, F, A, B>(parser: P, map_fn: F) -> impl Fn(&str) -> Result<(&str, B), &str>
+fn map<'a, P, F, A, B>(parser: P, map_fn: F) -> impl Parser<'a, B>
 where
-    P: Fn(&str) -> Result<(&str, A), &str>,
+    P: Parser<'a, A>,
     F: Fn(A) -> B,
 {
-    move |input| parser(input).map(|(next_input, result)| (next_input, map_fn(result)))
+    move |input| {
+        parser
+            .parse(input)
+            .map(|(next_input, result)| (next_input, map_fn(result)))
+    }
+}
+
+fn left<'a, P1, P2, R1, R2>(parser1: P1, parser2: P2) -> impl Parser<'a, R1>
+where
+    P1: Parser<'a, R1>,
+    P2: Parser<'a, R2>,
+{
+    map(pair(parser1, parser2), |(left, _right)| left)
+}
+
+fn right<'a, P1, P2, R1, R2>(parser1: P1, parser2: P2) -> impl Parser<'a, R2>
+where
+    P1: Parser<'a, R1>,
+    P2: Parser<'a, R2>,
+{
+    map(pair(parser1, parser2), |(_left, right)| right)
+}
+
+fn quoted_str<'a>() -> impl Parser<'a, String> {
+    map(
+        right(
+            match_literal("\""),
+            left(
+                zero_or_many(pred(any_char, |c| *c != '"')),
+                match_literal("\""),
+            ),
+        ),
+        |chars| chars.into_iter().collect(),
+    )
+}
+
+fn one_or_many<'a, P, A>(parser: P) -> impl Parser<'a, Vec<A>>
+where
+    P: Parser<'a, A>,
+{
+    move |mut input| {
+        let mut result = Vec::new();
+        if let Ok((next_input, first_item)) = parser.parse(input) {
+            input = next_input;
+            result.push(first_item);
+        } else {
+            return Err(input);
+        }
+
+        while let Ok((next_input, next_item)) = parser.parse(input) {
+            input = next_input;
+            result.push(next_item);
+        }
+
+        Ok((input, result))
+    }
+}
+
+fn zero_or_many<'a, P, A>(parser: P) -> impl Parser<'a, Vec<A>>
+where
+    P: Parser<'a, A>,
+{
+    move |mut input| {
+        let mut result = Vec::new();
+
+        while let Ok((next_input, next_item)) = parser.parse(input) {
+            input = next_input;
+            result.push(next_input);
+        }
+
+        Ok((input, result))
+    }
+}
+
+fn attribute_pair<'a>() -> impl Parser<'a, (String, String)> {
+    pair(identifier, right(match_literal("="), quoted_str()))
 }
 
 #[test]
 fn literal_parser() {
-    let parse_joe = match_literal("Hello Veronika!");
-    assert_eq!(Err("Hello Calleum!"), parse_joe("Hello Calleum!"));
+    let parse_v = match_literal("Hello Veronika!");
+    assert_eq!(
+        Ok(("Hello Veronika!", ())),
+        parse_v.parse("Hello Veronika!")
+    );
+
+    assert_eq!(Err("Hello Calleum!"), parse_v.parse("Hello Calleum!"));
 }
 
 #[test]
@@ -94,12 +204,50 @@ fn identifier_parser() {
 }
 
 #[test]
+fn quoted_string_parser() {
+    assert_eq!(
+        Ok(("", "Hello isha!".to_string())),
+        quoted_str().parse("\"Hello isha!\"")
+    );
+}
+
+#[test]
 fn pair_combinator() {
     let tag_opener = pair(match_literal("<"), identifier);
     assert_eq!(
         Ok(("/>", ((), "my-first-element".to_string()))),
-        tag_opener("<my-first-element/>")
+        tag_opener.parse("<my-first-element/>")
     );
-    assert_eq!(Err("oops"), tag_opener("oops"));
-    assert_eq!(Err("!oops"), tag_opener("<!oops"));
+    assert_eq!(Err("oops"), tag_opener.parse("oops"));
+    assert_eq!(Err("!oops"), tag_opener.parse("<!oops"));
+}
+
+#[test]
+fn right_comb() {
+    let tag_op = right(match_literal("<"), identifier);
+    assert_eq!(Err("thing"), tag_op.parse("thing"));
+    assert_eq!(Err("!ah"), tag_op.parse("<!ah"));
+}
+
+#[test]
+fn one_or_more_comb() {
+    let p = one_or_many(match_literal("ja"));
+    assert_eq!(Ok(("", vec![(), (), ()])), p.parse("jajaja"));
+    assert_eq!(Err("ajajdingdong"), p.parse("ajajdingdong"));
+    assert_eq!(Err(""), p.parse(""));
+}
+
+#[test]
+fn zero_or_more_comb() {
+    let p = zero_or_many(match_literal("ja"));
+    assert_eq!(Ok(("", vec![(), (), ()])), p.parse("jajaja"));
+    assert_eq!(Ok(("ajajdingdong", vec![])), p.parse("ajajdingdong"));
+    assert_eq!(Ok(("", vec![])), p.parse(""));
+}
+
+#[test]
+fn predicate_combinator() {
+    let p = pred(any_char, |c| *c == 'h');
+    assert_eq!(Ok(("ey", 'h')), p.parse("hey"));
+    assert_eq!(Err("key"), p.parse("key"));
 }
