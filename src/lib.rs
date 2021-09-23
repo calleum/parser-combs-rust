@@ -1,3 +1,4 @@
+#![type_length_limit = "16777216"]
 type ParseResult<'a, Output> = Result<(&'a str, Output), &'a str>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +169,7 @@ where
 
         while let Ok((next_input, next_item)) = parser.parse(input) {
             input = next_input;
-            result.push(next_input);
+            result.push(next_item);
         }
 
         Ok((input, result))
@@ -177,6 +178,25 @@ where
 
 fn attribute_pair<'a>() -> impl Parser<'a, (String, String)> {
     pair(identifier, right(match_literal("="), quoted_str()))
+}
+
+fn attributes<'a>() -> impl Parser<'a, Vec<(String, String)>> {
+    zero_or_many(right(space_one(), attribute_pair()))
+}
+
+fn element_start<'a>() -> impl Parser<'a, (String, Vec<(String, String)>)> {
+    right(match_literal("<"), pair(identifier, attributes()))
+}
+
+fn single_element<'a>() -> impl Parser<'a, Element> {
+    map(
+        left(element_start(), match_literal("/>")),
+        |(name, attributes)| Element {
+            name,
+            attributes,
+            children: vec![],
+        },
+    )
 }
 
 #[test]
@@ -250,4 +270,18 @@ fn predicate_combinator() {
     let p = pred(any_char, |c| *c == 'h');
     assert_eq!(Ok(("ey", 'h')), p.parse("hey"));
     assert_eq!(Err("key"), p.parse("key"));
+}
+
+#[test]
+fn attribute_parser() {
+    assert_eq!(
+        Ok((
+            "",
+            vec![
+                ("one".to_string(), "1".to_string()),
+                ("two".to_string(), "2".to_string())
+            ]
+        )),
+        attributes().parse("one=\"1\", two=\"2\"")
+    );
 }
