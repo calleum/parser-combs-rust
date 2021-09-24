@@ -8,8 +8,32 @@ struct Element {
     children: Vec<Element>,
 }
 
+enum List<A> {
+    Cons(A, Box<List<A>>),
+    Nil,
+}
+
 trait Parser<'a, Output> {
     fn parse(&self, input: &'a str) -> ParseResult<'a, Output>;
+
+    fn map<F, NewOutput>(self, map_fn: F) -> BoxedParser<'a, NewOutput>
+    where
+        Self: Sized + 'a,
+        Output: 'a,
+        NewOutput: 'a,
+        F: Fn(Output) -> NewOutput + 'a,
+    {
+        BoxedParser::new(map(self, map_fn))
+    }
+
+    fn pred<F>(self, pred_fn: F) -> BoxedParser<'a, Output>
+    where
+        Self: Sized + 'a,
+        Output: 'a,
+        F: Fn(&Output) -> bool + 'a,
+    {
+        BoxedParser::new(pred(self, pred_fn))
+    }
 }
 
 impl<'a, F, Output> Parser<'a, Output> for F
@@ -18,6 +42,27 @@ where
 {
     fn parse(&self, input: &'a str) -> ParseResult<'a, Output> {
         self(input)
+    }
+}
+
+struct BoxedParser<'a, Output> {
+    parser: Box<dyn Parser<'a, Output> + 'a>,
+}
+
+impl<'a, Output> BoxedParser<'a, Output> {
+    fn new<P>(parser: P) -> Self
+    where
+        P: Parser<'a, Output> + 'a,
+    {
+        BoxedParser {
+            parser: Box::new(parser),
+        }
+    }
+}
+
+impl<'a, Output> Parser<'a, Output> for BoxedParser<'a, Output> {
+    fn parse(&self, input: &'a str) -> ParseResult<'a, Output> {
+        self.parser.parse(input)
     }
 }
 
@@ -126,16 +171,14 @@ where
 }
 
 fn quoted_str<'a>() -> impl Parser<'a, String> {
-    map(
-        right(
+    right(
+        match_literal("\""),
+        left(
+            zero_or_many(any_char.pred(|c| *c != '"')),
             match_literal("\""),
-            left(
-                zero_or_many(pred(any_char, |c| *c != '"')),
-                match_literal("\""),
-            ),
         ),
-        |chars| chars.into_iter().collect(),
     )
+    .map(|chars| chars.into_iter().collect())
 }
 
 fn one_or_many<'a, P, A>(parser: P) -> impl Parser<'a, Vec<A>>
@@ -189,23 +232,25 @@ fn element_start<'a>() -> impl Parser<'a, (String, Vec<(String, String)>)> {
 }
 
 fn single_element<'a>() -> impl Parser<'a, Element> {
-    map(
-        left(element_start(), match_literal("/>")),
-        |(name, attributes)| Element {
-            name,
-            attributes,
-            children: vec![],
-        },
-    )
+    left(element_start(), match_literal("/>")).map(|(name, attributes)| Element {
+        name,
+        attributes,
+        children: vec![],
+    })
+}
+
+fn open_element<'a>() -> impl Parser<'a, Element> {
+    left(element_start(), match_literal(">")).map(|(name, attributes)| Element {
+        name,
+        attributes,
+        children: vec![],
+    })
 }
 
 #[test]
 fn literal_parser() {
     let parse_v = match_literal("Hello Veronika!");
-    assert_eq!(
-        Ok(("Hello Veronika!", ())),
-        parse_v.parse("Hello Veronika!")
-    );
+    assert_eq!(Ok(("", ())), parse_v.parse("Hello Veronika!"));
 
     assert_eq!(Err("Hello Calleum!"), parse_v.parse("Hello Calleum!"));
 }
@@ -218,7 +263,7 @@ fn identifier_parser() {
     );
     assert_eq!(Err("!not an iden"), identifier("!not an iden"));
     assert_eq!(
-        Ok(("entirely an identifier", "not".to_string())),
+        Ok((" entirely an identifier", "not".to_string())),
         identifier("not entirely an identifier")
     );
 }
@@ -282,6 +327,21 @@ fn attribute_parser() {
                 ("two".to_string(), "2".to_string())
             ]
         )),
-        attributes().parse("one=\"1\", two=\"2\"")
+        attributes().parse(" one=\"1\" two=\"2\"")
+    );
+}
+
+#[test]
+fn single_element_parser() {
+    assert_eq!(
+        Ok((
+            "",
+            Element {
+                name: "div".to_string(),
+                attributes: vec![("class".to_string(), "float".to_string())],
+                children: vec![]
+            }
+        )),
+        single_element().parse("<div class=\"float\"/>")
     );
 }
